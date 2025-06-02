@@ -1,11 +1,19 @@
 #!/bin/bash
 
-# OpenGenome to MDS Conversion Script
+# OpenGenome to MDS Conversion Script for Biowulf
 # This script runs the conversion with appropriate settings
 
 set -e  # Exit on any error
 
-echo "Starting OpenGenome to MDS conversion..."
+echo "Starting OpenGenome to MDS conversion on Biowulf..."
+
+# Activate the conda environment
+echo "Activating conda environment..."
+source activate opengenome_conversion
+
+# Verify environment
+echo "Verifying environment..."
+python -c "import datasets; import streaming; print('Environment verified!')"
 
 # Set the data path
 DATA_PATH="/data/lindseylm/PROPHAGE_IDENTIFICATION_LLM/DATA"

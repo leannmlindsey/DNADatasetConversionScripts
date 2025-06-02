@@ -14,15 +14,35 @@ The main script `convert_opengenome_to_mds.py` converts the OpenGenome dataset f
 - Creates sharded MDS files for efficient streaming
 - Formats genomic data with taxonomy classification and DNA sequences
 
-### Installation
+### Installation on Biowulf
 
 ```bash
 # Clone the repository
 git clone https://github.com/leannmlindsey/DNADatasetConversionScripts.git
 cd DNADatasetConversionScripts
 
-# Install dependencies
-pip install -r requirements.txt
+# Set up conda environment (Biowulf-compatible)
+chmod +x setup_environment.sh
+./setup_environment.sh
+
+# Activate the environment
+conda activate opengenome_conversion
+```
+
+Alternatively, you can set up the environment manually:
+
+```bash
+# Create conda environment 
+conda create -n opengenome_conversion python=3.10
+conda activate opengenome_conversion
+
+# Install dependencies (in this specific order for Biowulf compatibility)
+pip install torch transformers
+pip install numpy pandas
+pip install tqdm
+pip install datasets
+pip install mosaicml-streaming
+pip install huggingface_hub
 ```
 
 ### Usage
