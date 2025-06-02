@@ -50,12 +50,44 @@ def setup_directories(base_path: str) -> Dict[str, str]:
     
     return directories
 
-def format_genome2_text(example: Dict[str, Any]) -> Dict[str, str]:
+def segment_sequence(sequence: str, chunk_size: int, overlap: int = 0) -> List[str]:
     """
-    Format OpenGenome2 data for BERT training.
+    Split a sequence into chunks of specified size with optional overlap.
+    
+    Args:
+        sequence: The DNA sequence to segment
+        chunk_size: The size of each chunk
+        overlap: Number of overlapping characters between chunks (default: 0)
+    
+    Returns:
+        List of sequence chunks
+    """
+    if len(sequence) <= chunk_size:
+        return [sequence]
+    
+    chunks = []
+    step = chunk_size - overlap
+    
+    for i in range(0, len(sequence) - overlap, step):
+        chunk = sequence[i:i + chunk_size]
+        if len(chunk) >= chunk_size // 2:  # Only include chunks that are at least half the target size
+            chunks.append(chunk)
+    
+    return chunks
+
+def format_genome2_text(example: Dict[str, Any], chunk_size: int = None) -> List[Dict[str, str]]:
+    """
+    Format OpenGenome2 data for BERT training, optionally segmenting into chunks.
     
     OpenGenome2 contains raw DNA sequences without taxonomic information.
     This function handles the inconsistent schema (text vs record fields).
+    
+    Args:
+        example: Dictionary containing the dataset example
+        chunk_size: If provided, segment sequences into this size
+    
+    Returns:
+        List of dictionaries with formatted text
     """
     # Handle inconsistent schema in OpenGenome2
     text_content = ""
@@ -75,10 +107,21 @@ def format_genome2_text(example: Dict[str, Any]) -> Dict[str, str]:
         logger.warning(f"No valid text content found in example: {list(example.keys())}")
         text_content = ""
     
-    # Format for BERT training - since no taxonomy, just mark as raw DNA
-    formatted_text = f"[DNA_SEQUENCE] {text_content}"
-    
-    return {"text": formatted_text}
+    if chunk_size is None:
+        # No segmentation, return as single item
+        formatted_text = f"[DNA_SEQUENCE] {text_content}"
+        return [{"text": formatted_text}]
+    else:
+        # Segment the sequence
+        sequence_chunks = segment_sequence(text_content, chunk_size)
+        formatted_examples = []
+        
+        for i, chunk in enumerate(sequence_chunks):
+            # Include chunk index in the formatting for tracking
+            formatted_text = f"[CHUNK] {i+1}/{len(sequence_chunks)} [DNA_SEQUENCE] {chunk}"
+            formatted_examples.append({"text": formatted_text})
+        
+        return formatted_examples
 
 def load_opengenome2_safely(config_name: Optional[str] = None, split: Optional[str] = None) -> Optional[Dataset]:
     """
@@ -163,11 +206,13 @@ def inspect_dataset_structure(dataset: Dataset, name: str = "dataset") -> None:
         logger.error(f"Error inspecting dataset: {e}")
 
 def convert_to_mds(dataset: Dataset, output_dir: Path, split: str, 
-                   shard_size: int = 100000) -> None:
-    """Convert dataset to MDS format with sharding"""
+                   shard_size: int = 100000, chunk_size: int = None) -> None:
+    """Convert dataset to MDS format with sharding and optional sequence segmentation"""
     
     logger.info(f"Converting {split} to MDS format...")
     logger.info(f"Output directory: {output_dir}")
+    if chunk_size:
+        logger.info(f"Segmenting sequences into chunks of {chunk_size}")
     
     # Define the schema for MDS
     columns = {
@@ -182,6 +227,7 @@ def convert_to_mds(dataset: Dataset, output_dir: Path, split: str,
         ) as writer:
             
             processed_count = 0
+            total_chunks = 0
             error_count = 0
             
             # Handle both regular and streaming datasets
@@ -192,20 +238,23 @@ def convert_to_mds(dataset: Dataset, output_dir: Path, split: str,
             
             for i, example in enumerate(iterator):
                 try:
-                    # Format the example
-                    formatted_example = format_genome2_text(example)
+                    # Format the example with optional segmentation
+                    formatted_examples = format_genome2_text(example, chunk_size)
                     
-                    # Skip empty examples
-                    if not formatted_example['text'].strip():
-                        error_count += 1
-                        continue
+                    # Write each segment to MDS
+                    for formatted_example in formatted_examples:
+                        # Skip empty examples
+                        if not formatted_example['text'].strip():
+                            error_count += 1
+                            continue
+                        
+                        writer.write(formatted_example)
+                        total_chunks += 1
                     
-                    # Write to MDS
-                    writer.write(formatted_example)
                     processed_count += 1
                     
                     if processed_count % 10000 == 0:
-                        logger.info(f"Processed {processed_count} examples...")
+                        logger.info(f"Processed {processed_count} examples ({total_chunks} chunks)...")
                         
                 except Exception as e:
                     logger.warning(f"Error processing example {i}: {e}")
@@ -215,7 +264,7 @@ def convert_to_mds(dataset: Dataset, output_dir: Path, split: str,
                         break
         
         logger.info(f"Successfully converted {split} to MDS format")
-        logger.info(f"Processed: {processed_count}, Errors: {error_count}")
+        logger.info(f"Processed: {processed_count} examples into {total_chunks} chunks, Errors: {error_count}")
         
         # Log shard information
         shard_files = list(output_dir.glob("*.mds"))
@@ -247,7 +296,7 @@ def create_synthetic_splits(dataset: Dataset, train_ratio: float = 0.8,
     
     return splits
 
-def save_dataset_info(directories: Dict, base_path: str) -> None:
+def save_dataset_info(directories: Dict, base_path: str, chunk_size: int = None) -> None:
     """Save information about the converted datasets"""
     
     info = {
@@ -261,12 +310,17 @@ def save_dataset_info(directories: Dict, base_path: str) -> None:
             "Inconsistent schema (text vs record fields)",
             "Single configuration (no stage1/stage2)"
         ],
+        "segmentation": {
+            "enabled": chunk_size is not None,
+            "chunk_size": chunk_size if chunk_size else "N/A",
+            "note": "Sequences segmented to fit ModernBERT context windows" if chunk_size else "No segmentation applied"
+        },
         "directory_structure": {
             "train": str(directories['main']['train']),
             "validation": str(directories['main']['validation']),
             "test": str(directories['main']['test'])
         },
-        "text_format": "[DNA_SEQUENCE] raw_dna_sequence"
+        "text_format": "[CHUNK] n/total [DNA_SEQUENCE] raw_dna_sequence" if chunk_size else "[DNA_SEQUENCE] raw_dna_sequence"
     }
     
     info_path = Path(base_path) / 'opengenome2_mds' / 'dataset_info.json'
@@ -305,6 +359,12 @@ def main():
         type=int, 
         default=None,
         help='Use only a sample of the dataset for testing'
+    )
+    parser.add_argument(
+        '--chunk_size', 
+        type=int, 
+        default=8192,
+        help='Size of sequence chunks (default: 8192 for ModernBERT)'
     )
     
     args = parser.parse_args()
@@ -354,10 +414,10 @@ def main():
             
         logger.info(f"\n--- Converting {split_name} split ---")
         output_dir = directories['main'][split_name]
-        convert_to_mds(split_dataset, output_dir, split_name, args.shard_size)
+        convert_to_mds(split_dataset, output_dir, split_name, args.shard_size, args.chunk_size)
     
     # Save dataset information
-    save_dataset_info(directories, args.data_path)
+    save_dataset_info(directories, args.data_path, args.chunk_size)
     
     logger.info("\n=== Conversion Complete ===")
     logger.info(f"Converted datasets available at: {args.data_path}/opengenome2_mds/")
