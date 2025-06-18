@@ -138,12 +138,24 @@ def download_and_inspect_dataset(stage: str, split: str) -> Any:
         return None
 
 def convert_to_mds(dataset: Any, output_dir: Path, stage: str, split: str, 
-                   shard_size: int = 100000, chunk_size: int = None) -> None:
-    """Convert dataset to MDS format with sharding and optional sequence segmentation"""
+                   shard_size: int = 100000, chunk_size: int = None,
+                   shards_per_dir: int = 1000) -> None:
+    """Convert dataset to MDS format with sharding and optional sequence segmentation
+    
+    Args:
+        dataset: The dataset to convert
+        output_dir: Base output directory
+        stage: Stage name (stage1 or stage2)
+        split: Split name (train, validation, test)
+        shard_size: Number of examples per shard
+        chunk_size: Size for sequence segmentation
+        shards_per_dir: Maximum number of shards per subdirectory
+    """
     
     logger.info(f"Converting {stage} {split} to MDS format...")
     logger.info(f"Dataset size: {len(dataset)}")
     logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Maximum shards per subdirectory: {shards_per_dir}")
     if chunk_size:
         logger.info(f"Segmenting sequences into chunks of {chunk_size}")
     
@@ -152,36 +164,65 @@ def convert_to_mds(dataset: Any, output_dir: Path, stage: str, split: str,
         'text': 'str'
     }
     
-    try:
-        with MDSWriter(
-            out=str(output_dir),
-            columns=columns,
-            size_limit=shard_size
-        ) as writer:
+    # Process in batches to create multiple subdirectories
+    total_chunks = 0
+    shard_count = 0
+    current_subdir_index = 0
+    
+    # Calculate approximate number of chunks
+    approx_chunks_per_example = 1 if chunk_size is None else 10  # Estimate
+    total_expected_chunks = len(dataset) * approx_chunks_per_example
+    chunks_per_subdir = shards_per_dir * shard_size
+    
+    batch_size = max(1, chunks_per_subdir // approx_chunks_per_example)
+    
+    for batch_start in range(0, len(dataset), batch_size):
+        batch_end = min(batch_start + batch_size, len(dataset))
+        
+        # Create subdirectory for this batch
+        subdir = output_dir / f"shard_group_{current_subdir_index:04d}"
+        subdir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Processing batch {batch_start}-{batch_end} in {subdir}")
+        
+        try:
+            with MDSWriter(
+                out=str(subdir),
+                columns=columns,
+                size_limit=shard_size
+            ) as writer:
+                
+                for i in range(batch_start, batch_end):
+                    example = dataset[i]
+                    # Format the example with optional segmentation
+                    formatted_examples = format_genome_text(example, chunk_size)
+                    
+                    # Write each segment to MDS
+                    for formatted_example in formatted_examples:
+                        writer.write(formatted_example)
+                        total_chunks += 1
+                    
+                    if (i + 1) % 10000 == 0:
+                        logger.info(f"Processed {i + 1}/{len(dataset)} examples ({total_chunks} chunks)...")
             
-            total_chunks = 0
-            for i, example in enumerate(dataset):
-                # Format the example with optional segmentation
-                formatted_examples = format_genome_text(example, chunk_size)
-                
-                # Write each segment to MDS
-                for formatted_example in formatted_examples:
-                    writer.write(formatted_example)
-                    total_chunks += 1
-                
-                if (i + 1) % 10000 == 0:
-                    logger.info(f"Processed {i + 1}/{len(dataset)} examples ({total_chunks} chunks)...")
-        
-        logger.info(f"Successfully converted {stage} {split} to MDS format")
-        logger.info(f"Total chunks written: {total_chunks}")
-        
-        # Log shard information
-        shard_files = list(output_dir.glob("*.mds"))
-        logger.info(f"Created {len(shard_files)} shards")
-        
-    except Exception as e:
-        logger.error(f"Error converting {stage} {split} to MDS: {e}")
-        raise
+            # Count shards in this subdirectory
+            shard_files = list(subdir.glob("*.mds"))
+            shard_count += len(shard_files)
+            logger.info(f"Created {len(shard_files)} shards in {subdir.name}")
+            
+            current_subdir_index += 1
+            
+        except Exception as e:
+            logger.error(f"Error converting batch {batch_start}-{batch_end} to MDS: {e}")
+            raise
+    
+    logger.info(f"Successfully converted {stage} {split} to MDS format")
+    logger.info(f"Total chunks written: {total_chunks}")
+    logger.info(f"Total shards created: {shard_count} across {current_subdir_index} subdirectories")
+    
+    # Log shard information across all subdirectories
+    total_shard_files = list(output_dir.glob("*/*.mds"))
+    logger.info(f"Total MDS files: {len(total_shard_files)}")
 
 def save_dataset_info(directories: Dict, base_path: str) -> None:
     """Save information about the converted datasets"""
@@ -253,6 +294,12 @@ def main():
         help='Number of examples per shard'
     )
     parser.add_argument(
+        '--shards_per_dir', 
+        type=int, 
+        default=1000,
+        help='Maximum number of shards per subdirectory (default: 1000)'
+    )
+    parser.add_argument(
         '--dry_run', 
         action='store_true',
         help='Only download and inspect data, do not convert'
@@ -288,7 +335,7 @@ def main():
             output_dir = directories[stage][split]
             # Stage 1: segment 8k to 1024, Stage 2: segment 131k to 8192
             chunk_size = 1024 if stage == 'stage1' else 8192
-            convert_to_mds(dataset, output_dir, stage, split, args.shard_size, chunk_size)
+            convert_to_mds(dataset, output_dir, stage, split, args.shard_size, chunk_size, args.shards_per_dir)
     
     if not args.dry_run:
         # Save dataset information
@@ -300,8 +347,10 @@ def main():
         for stage in args.stages:
             logger.info(f"  {stage}/")
             for split in args.splits:
-                shard_files = list(directories[stage][split].glob("*.mds"))
-                logger.info(f"    {split}/ ({len(shard_files)} shards)")
+                # Count shards across all subdirectories
+                shard_files = list(directories[stage][split].glob("**/*.mds"))
+                subdirs = list(directories[stage][split].glob("shard_group_*"))
+                logger.info(f"    {split}/ ({len(shard_files)} shards across {len(subdirs)} subdirectories)")
 
 if __name__ == "__main__":
     main()
