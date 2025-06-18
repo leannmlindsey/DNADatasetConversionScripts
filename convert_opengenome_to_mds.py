@@ -164,26 +164,21 @@ def convert_to_mds(dataset: Any, output_dir: Path, stage: str, split: str,
         'text': 'str'
     }
     
-    # Process in batches to create multiple subdirectories
+    # Process dataset with proper shard management
     total_chunks = 0
-    shard_count = 0
+    total_shards = 0
     current_subdir_index = 0
+    example_index = 0
     
-    # Calculate approximate number of chunks
-    approx_chunks_per_example = 1 if chunk_size is None else 10  # Estimate
-    total_expected_chunks = len(dataset) * approx_chunks_per_example
-    chunks_per_subdir = shards_per_dir * shard_size
-    
-    batch_size = max(1, chunks_per_subdir // approx_chunks_per_example)
-    
-    for batch_start in range(0, len(dataset), batch_size):
-        batch_end = min(batch_start + batch_size, len(dataset))
-        
-        # Create subdirectory for this batch
+    while example_index < len(dataset):
+        # Create subdirectory for this group of shards
         subdir = output_dir / f"shard_group_{current_subdir_index:04d}"
         subdir.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"Processing batch {batch_start}-{batch_end} in {subdir}")
+        logger.info(f"Starting subdirectory {subdir.name} at example {example_index}")
+        
+        # Track chunks written to current writer
+        chunks_in_current_writer = 0
         
         try:
             with MDSWriter(
@@ -192,33 +187,49 @@ def convert_to_mds(dataset: Any, output_dir: Path, stage: str, split: str,
                 size_limit=shard_size
             ) as writer:
                 
-                for i in range(batch_start, batch_end):
-                    example = dataset[i]
+                # Process examples until we reach the shard limit for this directory
+                while example_index < len(dataset):
+                    example = dataset[example_index]
+                    
                     # Format the example with optional segmentation
                     formatted_examples = format_genome_text(example, chunk_size)
+                    
+                    # Check if adding these chunks would exceed our shard limit
+                    # Estimate: chunks_written / shard_size = approximate current shard count
+                    estimated_current_shards = chunks_in_current_writer // shard_size
+                    estimated_new_chunks = len(formatted_examples)
+                    estimated_shards_after = (chunks_in_current_writer + estimated_new_chunks) // shard_size
+                    
+                    # If we would exceed the limit, break to start a new subdirectory
+                    if estimated_shards_after >= shards_per_dir and chunks_in_current_writer > 0:
+                        logger.info(f"Approaching shard limit ({estimated_shards_after} >= {shards_per_dir}), starting new subdirectory")
+                        break
                     
                     # Write each segment to MDS
                     for formatted_example in formatted_examples:
                         writer.write(formatted_example)
                         total_chunks += 1
+                        chunks_in_current_writer += 1
                     
-                    if (i + 1) % 10000 == 0:
-                        logger.info(f"Processed {i + 1}/{len(dataset)} examples ({total_chunks} chunks)...")
+                    example_index += 1
+                    
+                    if example_index % 10000 == 0:
+                        logger.info(f"Processed {example_index}/{len(dataset)} examples ({total_chunks} chunks, ~{chunks_in_current_writer // shard_size} shards in current dir)...")
             
-            # Count shards in this subdirectory
+            # Count actual shards created in this subdirectory
             shard_files = list(subdir.glob("*.mds"))
-            shard_count += len(shard_files)
-            logger.info(f"Created {len(shard_files)} shards in {subdir.name}")
+            total_shards += len(shard_files)
+            logger.info(f"Created {len(shard_files)} shards in {subdir.name} (Total: {total_shards})")
             
             current_subdir_index += 1
             
         except Exception as e:
-            logger.error(f"Error converting batch {batch_start}-{batch_end} to MDS: {e}")
+            logger.error(f"Error converting examples starting at {example_index} to MDS: {e}")
             raise
     
     logger.info(f"Successfully converted {stage} {split} to MDS format")
     logger.info(f"Total chunks written: {total_chunks}")
-    logger.info(f"Total shards created: {shard_count} across {current_subdir_index} subdirectories")
+    logger.info(f"Total shards created: {total_shards} across {current_subdir_index} subdirectories")
     
     # Log shard information across all subdirectories
     total_shard_files = list(output_dir.glob("*/*.mds"))
