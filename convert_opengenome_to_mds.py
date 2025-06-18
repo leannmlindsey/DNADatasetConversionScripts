@@ -179,6 +179,7 @@ def convert_to_mds(dataset: Any, output_dir: Path, stage: str, split: str,
         
         # Track chunks written to current writer
         chunks_in_current_writer = 0
+        examples_in_current_writer = 0
         
         try:
             with MDSWriter(
@@ -189,21 +190,32 @@ def convert_to_mds(dataset: Any, output_dir: Path, stage: str, split: str,
                 
                 # Process examples until we reach the shard limit for this directory
                 while example_index < len(dataset):
+                    # Check current shard count by looking at files in directory
+                    # MDSWriter creates files as it goes
+                    current_shard_files = list(subdir.glob("shard.*.mds"))
+                    current_shard_count = len(current_shard_files)
+                    
+                    # Get the highest shard number to see if we're approaching limit
+                    if current_shard_files:
+                        shard_numbers = []
+                        for f in current_shard_files:
+                            try:
+                                # Extract number from filename like "shard.12345.mds"
+                                num = int(f.stem.split('.')[1])
+                                shard_numbers.append(num)
+                            except:
+                                pass
+                        if shard_numbers:
+                            highest_shard = max(shard_numbers)
+                            # If we're getting close to the limit, finish this directory
+                            if highest_shard >= shards_per_dir - 100 and examples_in_current_writer > 0:
+                                logger.info(f"Approaching shard limit (highest shard: {highest_shard}, limit: {shards_per_dir}), starting new subdirectory")
+                                break
+                    
                     example = dataset[example_index]
                     
                     # Format the example with optional segmentation
                     formatted_examples = format_genome_text(example, chunk_size)
-                    
-                    # Check if adding these chunks would exceed our shard limit
-                    # Estimate: chunks_written / shard_size = approximate current shard count
-                    estimated_current_shards = chunks_in_current_writer // shard_size
-                    estimated_new_chunks = len(formatted_examples)
-                    estimated_shards_after = (chunks_in_current_writer + estimated_new_chunks) // shard_size
-                    
-                    # If we would exceed the limit, break to start a new subdirectory
-                    if estimated_shards_after >= shards_per_dir and chunks_in_current_writer > 0:
-                        logger.info(f"Approaching shard limit ({estimated_shards_after} >= {shards_per_dir}), starting new subdirectory")
-                        break
                     
                     # Write each segment to MDS
                     for formatted_example in formatted_examples:
@@ -212,9 +224,12 @@ def convert_to_mds(dataset: Any, output_dir: Path, stage: str, split: str,
                         chunks_in_current_writer += 1
                     
                     example_index += 1
+                    examples_in_current_writer += 1
                     
                     if example_index % 10000 == 0:
-                        logger.info(f"Processed {example_index}/{len(dataset)} examples ({total_chunks} chunks, ~{chunks_in_current_writer // shard_size} shards in current dir)...")
+                        # Get actual shard count
+                        current_shard_files = list(subdir.glob("shard.*.mds"))
+                        logger.info(f"Processed {example_index}/{len(dataset)} examples ({total_chunks} chunks, {len(current_shard_files)} shards in current dir)...")
             
             # Count actual shards created in this subdirectory
             shard_files = list(subdir.glob("*.mds"))
